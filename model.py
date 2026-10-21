@@ -16,21 +16,25 @@ from scipy.ndimage import maximum_filter
 
 HERE = Path(__file__).resolve().parent
 
-class Model:
-    def __init__(self) -> None:
+def _add_noise(data, mask, ng, pixel_size=2.):
         """
-        Model class constructor
-        """
-        
-        self.mask = np.load(HERE / "WIDE12H_bin2_2arcmin_mask.npy", allow_pickle=False)
-        self.labels = np.load(HERE / "label_newrealization.npy", mmap_mode="r", allow_pickle=False)
-        self.Ncosmo = 101
-        self.Nsys = 256
-        self.Ntest = 10000  # Number of instances in the test data
-        self.pixelsize_arcmin = 2 # pixel size in arcmin
-        self.pixelsize_radian = self.pixelsize_arcmin / 60 / 180 * np.pi # pixel size in radian
+        Add noise to a noiseless convergence map.
 
-    def power_spectrum(x, pixsize, kedge):
+        Parameters
+        ----------
+        data : np.array
+            Noiseless convergence maps.
+        mask : np.array
+            Binary mask map.
+        ng : float
+            Number of galaxies per arcmin². This determines the noise level; a larger number means smaller noise.
+        pixel_size : float, optional
+            Pixel size in arcminutes (default is 2.0).
+        """
+
+        return data + np.random.randn(*data.shape) * 0.4 / (2*ng*pixel_size**2)**0.5 * mask
+    
+def _power_spectrum(x, pixsize, kedge):
         """
         Compute the azimuthally averaged 2D power spectrum of a real-valued 2D field.
 
@@ -111,7 +115,53 @@ class Model:
         # Return the binned k values and corresponding power spectrum
         return power_k, power
     
-    def extract_peak_counts(map_2d, thresholds=np.linspace(-0.02, 0.06, 8)):
+class Model:
+    def __init__(self) -> None:
+        """
+        Model class constructor
+        """
+        
+        self.mask = np.load(HERE / "WIDE12H_bin2_2arcmin_mask.npy", allow_pickle=False)
+        self.labels = np.load(HERE / "label_newrealization.npy", mmap_mode="r", allow_pickle=False)
+        self.Ncosmo = 101
+        self.Nsys = 256
+        self.Ntest = 10000  # Number of instances in the test data
+        self.pixelsize_arcmin = 2 # pixel size in arcmin
+        self.pixelsize_radian = self.pixelsize_arcmin / 60 / 180 * np.pi # pixel size in radian
+        self.shape = [1424,176] # dimensions of each map
+        
+        print(self.mask.shape)
+
+    def scale_features(self):
+        # 1. Compute multi-summary statistics (Power Spectrum + Peak Counts) for training data
+        print("Extracting joint summary statistics for training data...")
+        num_peaks_features = 7  # 8 bins edge -> 7 features
+        joint_features = np.zeros((Ncosmo, Nsys, Nbins + num_peaks_features))
+
+        for i in range(self.Ncosmo):
+            for j in range(self.Nsys):
+                noisy_map = _add_noise(
+                    data=data_obj.kappa[i,j].astype(np.float64),
+                    mask=data_obj.mask,
+                    ng=data_obj.ng,
+                    pixel_size=data_obj.pixelsize_arcmin
+                )
+                # Power spectrum
+                _, ps = _power_spectrum(noisy_map, data_obj.pixelsize_radian, l_edge)
+                # Peak counts
+                pc = extract_peak_counts(noisy_map)
+                # Concatenate features
+                joint_features[i, j] = np.concatenate([np.log10(ps), pc])
+
+        joint_features_flat = joint_features.reshape(-1, Nbins + num_peaks_features)
+
+        # Standardize joint summary statistics
+        scaler_joint = StandardScaler()
+        joint_features_scaled = scaler_joint.fit_transform(joint_features_flat)
+        print("Features extracted and standardized. Shape:", joint_features_scaled.shape)
+        print(type(joint_features_scaled))
+        
+    def extract_peak_counts(self, map_2d, thresholds=np.linspace(-0.02, 0.06, 8)):
         """Extracts the local peak counts above different threshold levels."""
         local_max = (maximum_filter(map_2d, size=3) == map_2d)
         peaks = map_2d[local_max]
@@ -138,11 +188,16 @@ class Model:
             A numpy array of the predicted OoD scores
             shape = (N,)
         """
-
+        
+        self.Ntest = len(test_data)
+        self.test = np.zeros((self.Ntest, *self.shape), dtype=np.float16)
+        self.test[:,self.mask] = test_data
+        
+        # test_data = test_data.reshape((self.Ntest, 1424, 176))
         Nbins = 10
         l_edge = np.logspace(2, 4, Nbins+1)
         
-        with open("scaler.pkl", "rb") as f:
+        with open(HERE / "scaler.pkl", "rb") as f:
             scaler_joint = pickle.load(f)
     
         scaled_features = np.load(HERE / "joint_features_scaled.npy", allow_pickle=False)
@@ -162,7 +217,7 @@ class Model:
         transform = CompositeTransform(transforms)
 
         flow_er = Flow(transform, base_dist)
-        flow_er.load_state_dict(torch.load('flow_model.pt'))
+        flow_er.load_state_dict(torch.load(HERE / 'flow_model.pt'))
 
         flow_er.eval()
         
@@ -172,8 +227,8 @@ class Model:
 
         for i in range(self.Ntest):
             # Note: Test data already contains noise
-            test_map = test_data[i].astype(np.float64)
-            _, ps = self.power_spectrum(test_map, self.pixelsize_radian, l_edge)
+            test_map = self.test[i].astype(np.float64)
+            _, ps = _power_spectrum(test_map, self.pixelsize_radian, l_edge)
             pc = self.extract_peak_counts(test_map)
             test_joint_features[i] = np.concatenate([np.log10(ps), pc])
 
@@ -196,3 +251,6 @@ class Model:
         print("OoD scores calculated! Ready to package and submit.")
   
         return ood_scores
+
+# model_obj = Model()
+# model_obj.predict(test_data = np.ones((100, 132019)))
